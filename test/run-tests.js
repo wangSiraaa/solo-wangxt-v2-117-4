@@ -61,6 +61,8 @@ async function startServer({ crashAfterCommit = false } = {}) {
     PGUSER: 'collab',
     LOG_LEVEL: 'warn',
     CRASH_AFTER_COMMIT: crashAfterCommit ? '1' : '0',
+    // Short TTL keeps the ephemeral-view expiry test fast.
+    VIEW_TTL_MS: process.env.VIEW_TTL_MS || '1500',
   };
   serverProc = spawn(process.execPath, [SERVER], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   serverProc.stdout.on('data', (d) => process.env.VERBOSE && process.stdout.write(`[srv] ${d}`));
@@ -690,13 +692,164 @@ const t10 = test('T10 normal restart after persisted traffic: reconnecting clien
 });
 
 // ---------------------------------------------------------------------------
+// T11 ephemeral "view position": in-room broadcast, room isolation,
+// bounds rejection, out-of-bounds pruning, disconnect/TTL/restart cleanup
+// ---------------------------------------------------------------------------
+const t11 = test('T11 ephemeral views broadcast, isolate, expire and never touch document state', async () => {
+  await createDoc('t11', { writers: ['user-alice', 'user-bob'], readers: ['user-carol'] });
+  // t11b is a different document in the same tenant: its members must never
+  // see t11 view traffic.
+  await createDoc('t11b', { writers: ['user-owner'] });
+
+  const a = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't11' });
+  const b = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't11' });
+  const other = new DocClient({ url: WS_URL, token: 'user-owner', docId: 't11b' });
+  await Promise.all([a.connect(), b.connect(), other.connect()]);
+
+  // Prime enough text for the ranges used below.
+  a.localEdit((t) => t.insert(0, '0123456789-SECOND-PART'));
+  await a.flush();
+  await sleep(100);
+
+  // A reader may advertise a position too (it is not a document write).
+  const carol = new DocClient({ url: WS_URL, token: 'user-carol', docId: 't11' });
+  await carol.connect();
+
+  // --- broadcast within the authenticated room only ---------------------
+  const bViews = collect(b, 'view');
+  const otherViews = collect(other, 'view');
+
+  const ackP = a.nextViewAck((m) => m.ok === true);
+  a.sendView(2, 7);
+  const ack = await ackP;
+  assert.equal(ack.start, 2);
+  assert.equal(ack.end, 7);
+  assert.ok(ack.ttlMs > 0, 'ack carries the agreed validity window');
+  const v1 = await bViews.wait((m) => m.userId === 'user-alice' && m.start === 2 && m.end === 7);
+  assert.equal(v1.name, 'Alice');
+  bViews.stop();
+
+  // Another document's member observes nothing.
+  await sleep(200);
+  assert.ok(!other.peerViews.has('user-alice'), 'views must not leak across documents');
+  otherViews.stop();
+
+  // --- offsets past the current text are rejected, not stored ----------
+  const badAckP = a.nextViewAck((m) => m.ok === false);
+  a.sendView(0, 9999);
+  const badAck = await badAckP;
+  assert.equal(badAck.code, 'BAD_SELECTION');
+  await sleep(100);
+  assert.equal(b.peerViews.get('user-alice').start, 2,
+    'rejected view must not replace the valid one');
+
+  // Malformed shape (start > end) is rejected as well.
+  const badShapeP = a.nextViewAck((m) => m.ok === false);
+  a.sendView(9, 3);
+  const badShape = await badShapeP;
+  assert.equal(badShape.code, 'BAD_SELECTION');
+
+  // --- a late joiner receives the currently valid views ----------------
+  const late = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't11' });
+  const snap = new Promise((resolve) => late.on('views', resolve));
+  await late.connect();
+  const snapMsg = await snap;
+  const aliceSnap = snapMsg.views.find((v) => v.userId === 'user-alice');
+  assert.ok(aliceSnap, 'new joiner receives active views');
+  assert.deepEqual([aliceSnap.start, aliceSnap.end], [2, 7]);
+
+  // --- moving the selection delivers the latest position ---------------
+  const bViews2 = collect(b, 'view');
+  a.sendView(11, 16);
+  const v2 = await bViews2.wait((m) => m.userId === 'user-alice' && m.start === 11 && m.end === 16);
+  assert.equal(v2.end, 16);
+  bViews2.stop();
+  assert.deepEqual([b.peerViews.get('user-alice').start, b.peerViews.get('user-alice').end], [11, 16]);
+
+  // --- a Yjs edit that pushes the view out of bounds clears it ---------
+  const aClears = collect(a, 'view-clear');
+  const bClears = collect(b, 'view-clear');
+  b.localEdit((t) => t.delete(10, t.length - 10)); // keep first 10 chars
+  await b.flush();
+  const clrB = await bClears.wait((m) => m.userId === 'user-alice');
+  const clrA = await aClears.wait((m) => m.userId === 'user-alice');
+  assert.equal(clrB.reason, 'out-of-bounds');
+  assert.equal(clrA.reason, 'out-of-bounds');
+  aClears.stop();
+  bClears.stop();
+  assert.ok(!b.peerViews.has('user-alice'), 'pruned view disappears on peers');
+  assert.ok(!a.peerViews.has('user-alice'), 'pruned view disappears on the owner too');
+
+  // Document convergence is completely unaffected by the view traffic.
+  const conv = await settleConvergence([a, b, carol, late], 't11');
+  assert.equal(conv.text, '0123456789');
+
+  // --- disconnect clears the view for everyone -------------------------
+  a.sendView(0, 4);
+  await sleep(150);
+  assert.ok(b.peerViews.has('user-alice'));
+  const discClr = collect(b, 'view-clear');
+  a.hardClose();
+  const dc = await discClr.wait((m) => m.userId === 'user-alice');
+  assert.equal(dc.reason, 'disconnect');
+  discClr.stop();
+  assert.ok(!b.peerViews.has('user-alice'));
+
+  // --- TTL expiry clears the view even while the socket stays open -----
+  await a.connect();
+  await sleep(50);
+  a.sendView(1, 3);
+  await sleep(150);
+  assert.ok(b.peerViews.has('user-alice'), 'refreshed view is live');
+  const expClr = collect(b, 'view-clear');
+  const expired = await expClr.wait((m) => m.userId === 'user-alice' && m.reason === 'expired',
+    4000);
+  assert.ok(expired);
+  expClr.stop();
+
+  // --- gateway restart: views vanish, document state stays consistent --
+  a.localEdit((t) => t.insert(t.length, 'AFTER'));
+  await a.flush();
+  const beforeHash = a.stateHash();
+  const persistedBefore = await sqlCount('doc_updates', `WHERE doc_id='t11'`);
+  a.sendView(0, 2);
+  await sleep(150);
+  assert.ok(b.peerViews.has('user-alice'));
+
+  await stopServer();
+  a.hardClose();
+  b.hardClose();
+  await startServer({ crashAfterCommit: false });
+
+  // Restart must not have persisted anything view-related.
+  assert.equal(await sqlCount('doc_updates', `WHERE doc_id='t11'`), persistedBefore,
+    'views never enter the update log');
+  const recovered = await rebuildAndHash('t11');
+  assert.equal(recovered.hash, beforeHash, 'document state survives restart unchanged');
+  assert.ok(!recovered.text.includes('user-alice'), 'no view metadata in document text');
+
+  await a.reconnectWithStateVector();
+  const fresh = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't11' });
+  const freshSnap = new Promise((resolve) => fresh.on('views', resolve));
+  await fresh.connect();
+  const afterSnap = await freshSnap;
+  assert.equal(afterSnap.views.length, 0, 'ephemeral views do not survive a restart');
+  assert.equal(fresh.text, a.text);
+  const conv2 = await settleConvergence([a, fresh], 't11');
+  assert.equal(conv2.hash, beforeHash, 'reconnect sync converges to pre-restart document');
+
+  a.close(); fresh.close(); carol.close(); late.close(); other.close();
+});
+
+// ---------------------------------------------------------------------------
 // runner
 // ---------------------------------------------------------------------------
 async function main() {
   await setupTest();
   await startServer({ crashAfterCommit: false });
 
-  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10];
+  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11]
+    .filter((t) => !process.env.TEST_FILTER || t.name.includes(process.env.TEST_FILTER));
   let pass = 0;
   const failures = [];
   for (const t of tests) {

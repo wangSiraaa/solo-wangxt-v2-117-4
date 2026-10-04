@@ -115,6 +115,36 @@ JSON 文本帧；Yjs 二进制用 base64 字段传输。
 | c→s | `sync-req` | `sv` → `sync-diff {seq, update}` |
 | c→s | `compact` | `deleteFolded?`, `minUpdates?` → `compact-result` |
 | c→s | `ping` | → `pong` |
+| c→s | `view` | `selection: {start, end}`（`content` 文本上的字符偏移，半开区间） |
+| s→c | `view` | `userId`, `name`, `role`, `start`, `end`（广播给同房间其他连接） |
+| s→c | `view-ack` | `ok`, `start?`, `end?`, `ttlMs?`；失败带 `code/message` |
+| s→c | `view-clear` | `userId`, `reason`：`expired`/`disconnect`/`out-of-bounds`/`cleared` |
+| s→c | `views` | `views: [...]`（加入时收到的当前有效选区快照） |
+
+### 临时“查看位置”（view）
+
+演示协作时除了加入提示，还能看到同伴正在查看 `content` 的哪一段。这是
+**纯内存的临时信息**，与文档本身严格隔离：
+
+* 客户端在鉴权后的 room 内发送 `view {selection:{start,end}}`；`start/end`
+  必须是非负整数且 `0 ≤ start ≤ end ≤ 当前文本长度`，否则 `view-ack`
+  返回 `BAD_SELECTION`（畸形帧为 `BAD_ENVELOPE`），该选区不会保存。
+* 校验与保存都在该文档的**串行队列**内执行（与 Yjs apply 同一队列），
+  长度检查与缩短文本的更新不可能交错。
+* 保存后广播 `view` 给同房间其他成员；新加入者在 `hello-ok`/presence
+  之后收到一份当前有效选区快照 `views`。房间之间天然隔离：view 帧不带
+  docId，连接已绑定到鉴权房间，其他文档的成员收不到。
+* 选区有短暂有效期（`VIEW_TTL_MS`，默认 10 秒，测试用 1.5 秒）；客户端
+  刷新选区即续期。过期、发送者断线（该用户在本房间无其他连接）时网关
+  删除选区并向全房间广播 `view-clear`。
+* 后续 Yjs 更新应用后，网关立即检查所有已存选区，凡是 `end > 新文本长度`
+  的一律删除并广播 `view-clear {reason:'out-of-bounds'}`（发起缩短编辑
+  的人也会收到），绝不继续展示越界的错误位置。仍在界内的选区原样保留。
+* view 只存在于 room 内存：**不写 PostgreSQL、不进 `doc_updates` /
+  `doc_snapshots`、不进入任何 Yjs 更新或快照、不影响文档收敛**；网关
+  重启后全部消失，重连同步到的文档内容与原有状态逐字节一致。
+* `reader` 也可以广播自己的查看位置（这不是文档写操作），但文档写帧
+  仍然返回 `READ_ONLY`。
 
 实现中修掉的一个真实收敛 bug：早期版本把 update 回环广播给了发起者，发起者
 本地已应用过同一更新，重复应用导致它与其他副本发散。现在广播显式排除来源
@@ -191,6 +221,7 @@ npm test
 | T8 | 非成员、跨租户、未知 token、reader 写、会话中途撤销权限、HTTP 端点越权全部被拒 |
 | T9 | 3 客户端 60 个最大并发的插入/删除，收敛到同一哈希；日志恰好 61 行，无丢失/重复 |
 | T10 | 正常 SIGTERM 重启后，旧 SV 重连与冷副本全量加入都与重启前哈希一致，且不重复落库 |
+| T11 | 临时查看位置：同房间广播、跨文档隔离、晚加入者收快照、移动选区收最新位置；越界偏移拒绝；缩短文本使已存选区越界时双方收到 `out-of-bounds` 清除；断线/TTL 过期/重启后消失，且文档哈希与落库行数不受影响 |
 
 ---
 
@@ -204,6 +235,7 @@ src/permissions.js       token 解析 + 每次连接/更新的成员与租户校
 src/yutil.js             Yjs 文档/状态向量/差异/校验/恢复
 src/room.js              每文档内存房间（串行队列 + 从快照+尾部加载）
 src/update-service.js    鉴权→校验→去重持久化→应用→广播→ack（含崩溃注入开关）
+src/views.js             临时“查看位置”：内存存储/TTL/越界裁剪（不落库、不进 Yjs）
 src/compaction.js        压缩、双重一致性校验、存储恢复
 src/errorlog.js          update_errors 落库
 src/ws.js                WebSocket 协议

@@ -7,6 +7,7 @@ const { compact } = require('./compaction');
 const { resolveToken, getActiveRole } = require('./permissions');
 const yutil = require('./yutil');
 const { logError } = require('./errorlog');
+const views = require('./views');
 
 // Wire protocol (JSON text frames; Yjs binaries are base64 fields):
 //   client -> server  hello      { token, docId, sv?(b64 state vector) }
@@ -17,6 +18,15 @@ const { logError } = require('./errorlog');
 //   server -> client  update     { seq, msgId, origin, update(b64) }
 //   client -> server  sync-req   { sv(b64) }   -> sync-diff { seq, update(b64) }
 //   client -> server  ping       -> pong
+//
+// Ephemeral "view position" frames (memory only; never persisted, never
+// applied to the Yjs doc, absent from the update log and snapshots):
+//   client -> server  view       { selection: { start, end } }
+//   server -> client  view       { userId, name, role, start, end }  (peers)
+//   server -> client  view-ack   { ok, start, end } | { ok:false, code, message }
+//   server -> client  view-clear { userId, reason }
+//                        reason: expired | disconnect | out-of-bounds | cleared
+//   server -> client  views      { views: [...] }   (snapshot sent on join)
 //
 // The docId on every frame is the authenticated room's docId: client frames
 // never carry a room id after hello, so a client cannot write into another
@@ -34,7 +44,12 @@ async function wsConnection(socket /* WebSocket */, req) {
 
   socket.on('close', () => {
     closed = true;
-    if (room) room.sockets.delete(socket);
+    if (room) {
+      // Drop the user's ephemeral view (unless another socket of the same
+      // user remains) BEFORE removing the socket from the room set.
+      views.onDisconnect(room, socket);
+      room.sockets.delete(socket);
+    }
   });
 
   socket.on('message', async (raw) => {
@@ -72,6 +87,8 @@ async function wsConnection(socket /* WebSocket */, req) {
           return await handleSyncReq(socket, room, ctx, frame);
         case 'compact':
           return await handleCompact(socket, room, ctx, frame);
+        case 'view':
+          return await handleView(socket, room, ctx, frame);
         default:
           await logError({ docId: room.docId, userId: ctx.userId,
             tenantId: ctx.tenantId, raw: Buffer.from(raw), code: 'UNKNOWN_TYPE',
@@ -172,6 +189,10 @@ async function handleHello(socket, frame, bind) {
     joined: true,
     members: memberList(room),
   }, socket);
+
+  // Current valid ephemeral views in the room (memory only). Includes the
+  // joining user's own view when they reconnect with another socket.
+  safeSend(socket, { type: 'views', docId, views: views.snapshot(room) });
 }
 
 async function handleSyncReq(socket, room, ctx, frame) {
@@ -208,6 +229,40 @@ async function handleCompact(socket, room, ctx, frame) {
     minUpdates: frame.minUpdates || 1,
   });
   safeSend(socket, { type: 'compact-result', ...out });
+}
+
+// Ephemeral view position. Readers may advertise where they look too (it is
+// not a document write), but the connection must still be an authenticated
+// member of THIS room. Validation and storage run in the room's serial queue
+// so the text length cannot change between the bounds check and the store.
+async function handleView(socket, room, ctx, frame) {
+  const shape = views.checkShape(frame);
+  if (!shape.ok) {
+    await logError({ docId: room.docId, userId: ctx.userId, tenantId: ctx.tenantId,
+      code: shape.code, message: shape.message });
+    return safeSend(socket, { type: 'view-ack', ok: false,
+      code: shape.code, message: shape.message });
+  }
+  // Re-check membership on every frame, exactly like document writes: a
+  // member revoked mid-session must stop broadcasting positions.
+  const role = await getActiveRole(ctx.userId, room.docId);
+  if (!role || role.tenant_id !== ctx.tenantId) {
+    await logError({ docId: room.docId, userId: ctx.userId, tenantId: ctx.tenantId,
+      code: 'FORBIDDEN', message: 'view frame after access revoked' });
+    return safeSend(socket, { type: 'view-ack', ok: false,
+      code: 'FORBIDDEN', message: 'access revoked' });
+  }
+  await room.enqueue(() => {
+    const range = views.checkInRange(room, shape.start, shape.end);
+    if (!range.ok) {
+      safeSend(socket, { type: 'view-ack', ok: false,
+        code: range.code, message: range.message });
+      return;
+    }
+    views.setView(room, ctx, shape.start, shape.end);
+    safeSend(socket, { type: 'view-ack', ok: true,
+      start: shape.start, end: shape.end, ttlMs: require('./config').viewTtlMs });
+  });
 }
 
 function memberList(room) {

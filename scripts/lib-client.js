@@ -37,6 +37,10 @@ class DocClient {
     this.receivedUpdates = 0;
     this.errors = [];
 
+    // Ephemeral peer view positions keyed by userId (memory-only server
+    // state). The 'view' / 'view-clear' events fire on every change.
+    this.peerViews = new Map();
+
     this._waiters = new Map(); // event -> [fn]
   }
 
@@ -174,6 +178,34 @@ class DocClient {
       case 'pong':
         this.emit('pong');
         break;
+      case 'view': {
+        this.peerViews.set(msg.userId, {
+          name: msg.name,
+          role: msg.role,
+          start: msg.start,
+          end: msg.end,
+        });
+        this.emit('view', msg);
+        break;
+      }
+      case 'view-clear': {
+        this.peerViews.delete(msg.userId);
+        this.emit('view-clear', msg);
+        break;
+      }
+      case 'views': {
+        this.peerViews.clear();
+        for (const v of msg.views || []) {
+          this.peerViews.set(v.userId, {
+            name: v.name, role: v.role, start: v.start, end: v.end,
+          });
+        }
+        this.emit('views', msg);
+        break;
+      }
+      case 'view-ack':
+        this.emit('view-ack', msg);
+        break;
       case 'error':
         this.errors.push([msg.code, msg.message]);
         this.emit('error', msg);
@@ -260,6 +292,32 @@ class DocClient {
   // For tests: send arbitrary raw frame text (corruption / protocol abuse).
   sendRaw(text) {
     this.ws.send(text);
+  }
+
+  // Advertise the ephemeral view position over the `content` text. The
+  // server rejects offsets past the current text length; a refreshed view
+  // also extends the server-side TTL.
+  sendView(start, end) {
+    this.ws.send(JSON.stringify({ type: 'view', selection: { start, end } }));
+  }
+
+  // Resolves with the next view-ack matching the predicate (or any ack).
+  async nextViewAck(pred = null, timeoutMs = 5000) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const arr = this._waiters.get('view-ack');
+        if (arr) arr.splice(arr.indexOf(fn), 1);
+        reject(new Error('view-ack timeout'));
+      }, timeoutMs);
+      const fn = (m) => {
+        if (pred && !pred(m)) return;
+        clearTimeout(timer);
+        const arr = this._waiters.get('view-ack');
+        if (arr) arr.splice(arr.indexOf(fn), 1);
+        resolve(m);
+      };
+      this.on('view-ack', fn);
+    });
   }
 
   async requestSync(sv) {

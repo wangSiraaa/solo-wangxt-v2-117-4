@@ -14,6 +14,9 @@ class Room {
     this.docId = docId;
     this.doc = yutil.createDoc();
     this.sockets = new Set();
+    // Ephemeral per-user "view position" (userId -> entry). Memory only:
+    // never persisted, never part of a Yjs update or snapshot.
+    this.views = new Map();
     this.tail = Promise.resolve();
     this.loadedSeq = 0;
     this.compactions = 0;

@@ -18,4 +18,7 @@ module.exports = {
     password: env.PGPASSWORD || '',
     max: parseInt(env.PGPOOL || '10', 10),
   },
+  // Ephemeral "view position" entries are dropped after this many ms unless
+  // the client refreshes them. They live only in room memory.
+  viewTtlMs: parseInt(env.VIEW_TTL_MS || '10000', 10),
 };

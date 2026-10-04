@@ -4,6 +4,7 @@ const db = require('./db');
 const yutil = require('./yutil');
 const { getActiveRole } = require('./permissions');
 const { logError } = require('./errorlog');
+const views = require('./views');
 
 // Persistence boundary for an update frame:
 //   1. resolve & validate envelope (malformed -> update_errors, nack)
@@ -140,6 +141,10 @@ async function processUpdate(ws, room, ctx, payload) {
         origin: ctx.userId,
         update: updateB64,
       }, ws);
+      // The text may have shrunk: any saved ephemeral view whose offsets no
+      // longer fit must be dropped and the room notified. Runs in the same
+      // serial job right after the apply, so the length we check is final.
+      views.pruneOutOfBounds(room);
     }
     return { seq, duplicated };
   });

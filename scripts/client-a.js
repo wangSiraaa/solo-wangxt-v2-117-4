@@ -17,12 +17,21 @@ async function main() {
   await a.connect();
   console.log('A hello-ok role=', a.role, 'seq=', a.seq);
 
+  // Show peers where A is looking. Ephemeral only: lives in gateway memory,
+  // expires shortly after the last refresh, never enters the Yjs log.
+  a.on('view-clear', (m) => console.log(`A: peer view cleared (${m.userId}, ${m.reason})`));
+
   a.localEdit((t) => t.insert(0, 'Hello from A. '));
   await a.flush();
+  a.sendView(0, 12);
+  console.log('A announced view [0,12) ("Hello from A")');
 
   await sleep(400);
   a.localEdit((t) => t.insert(t.length, 'A adds line two.\n'));
   await a.flush();
+  // Move the selection to the new line; peers must see the latest position.
+  a.sendView(14, 27);
+  console.log('A moved view to [14,27) ("A adds line t")');
 
   await sleep(800);
   console.log('A final text:', JSON.stringify(a.text));
