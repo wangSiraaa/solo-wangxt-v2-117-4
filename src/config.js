@@ -18,4 +18,9 @@ module.exports = {
     password: env.PGPASSWORD || '',
     max: parseInt(env.PGPOOL || '10', 10),
   },
+  // Ephemeral "view position" selections live only in room memory. A
+  // selection not refreshed within this TTL is cleared and announced; the
+  // short default keeps stale positions out of a live demo. Overridable for
+  // tests. Nothing here is ever persisted to PostgreSQL.
+  selectionTtlMs: parseInt(env.SELECTION_TTL_MS || '30000', 10),
 };

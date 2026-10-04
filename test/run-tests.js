@@ -49,7 +49,7 @@ async function waitHealthy(timeoutMs = 5000) {
   throw new Error('server did not become healthy');
 }
 
-async function startServer({ crashAfterCommit = false } = {}) {
+async function startServer({ crashAfterCommit = false, extraEnv = {} } = {}) {
   await stopServer();
   const env = {
     ...process.env,
@@ -61,6 +61,7 @@ async function startServer({ crashAfterCommit = false } = {}) {
     PGUSER: 'collab',
     LOG_LEVEL: 'warn',
     CRASH_AFTER_COMMIT: crashAfterCommit ? '1' : '0',
+    ...extraEnv,
   };
   serverProc = spawn(process.execPath, [SERVER], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   serverProc.stdout.on('data', (d) => process.env.VERBOSE && process.stdout.write(`[srv] ${d}`));
@@ -575,6 +576,7 @@ function collect(client, event) {
   const fn = (m) => buf.push(m);
   client.on(event, fn);
   return {
+    buf,
     async wait(pred, timeoutMs = 5000) {
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
@@ -589,6 +591,18 @@ function collect(client, event) {
       if (arr) arr.splice(arr.indexOf(fn), 1);
     },
   };
+}
+
+// Negative assertion: no matching event arrives within the window. Used to
+// prove non-broadcast (cross-room isolation, cleared selection not joining).
+async function expectNothing(client, event, waitMs = 400) {
+  const seen = [];
+  const fn = (m) => seen.push(m);
+  client.on(event, fn);
+  await sleep(waitMs);
+  const arr = client._waiters.get(event);
+  if (arr) arr.splice(arr.indexOf(fn), 1);
+  assert.equal(seen.length, 0, `expected no ${event}, got ${JSON.stringify(seen)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -689,6 +703,301 @@ const t10 = test('T10 normal restart after persisted traffic: reconnecting clien
   a.close(); b.close();
 });
 
+// Negative assertion: connect a fresh client and confirm it receives NO
+// initial 'selections' snapshot (proves the in-memory range is gone).
+async function connectExpectNoSelections(client, waitMs = 400) {
+  const seen = [];
+  const fn = (m) => seen.push(m);
+  client.on('selections', fn);
+  await client.connect();
+  await sleep(waitMs);
+  const arr = client._waiters.get('selections');
+  if (arr) arr.splice(arr.indexOf(fn), 1);
+  assert.equal(seen.length, 0,
+    `newcomer must get no selection snapshot, got ${JSON.stringify(seen)}`);
+}
+
+// ---------------------------------------------------------------------------
+// T11 ephemeral view position: same-room delivery, cross-room isolation
+// ---------------------------------------------------------------------------
+const t11 = test('T11 selection is seen by room peers only, never by another document', async () => {
+  await createDoc('t11', { writers: ['user-alice', 'user-bob'], owners: ['user-owner'] });
+  await createDoc('t11-other', { owners: ['user-owner'] });
+
+  const a = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't11' });
+  const b = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't11' });
+  const c = new DocClient({ url: WS_URL, token: 'user-owner', docId: 't11-other' });
+  await Promise.all([a.connect(), b.connect(), c.connect()]);
+
+  a.localEdit((t) => t.insert(0, '0123456789'));
+  await a.flush();
+  await sleep(100);
+
+  const picksB = collect(b, 'selection');
+  const picksC = collect(c, 'selection');
+  const picksSelf = collect(a, 'selection');
+  a.sendSelection(2, 6);
+
+  const seen = await picksB.wait((m) => m.user.id === 'user-alice', 3000);
+  assert.equal(seen.start, 2);
+  assert.equal(seen.end, 6);
+  assert.equal(seen.user.name, 'Alice');
+
+  // The origin never gets its own range echoed back.
+  await sleep(200);
+  assert.equal(picksSelf.buf.length, 0, 'origin must not receive its own selection');
+  picksSelf.stop();
+
+  // A different document's member must learn nothing about t11 positions.
+  assert.equal(picksC.buf.length, 0, 'selection must not cross rooms');
+  picksC.stop();
+  picksB.stop();
+  a.close(); b.close(); c.close();
+});
+
+// ---------------------------------------------------------------------------
+// T12 moved selection is updated; text shrink out of bounds clears it for all
+// ---------------------------------------------------------------------------
+const t12 = test('T12 selection moves then is cleared for everyone when edits push it out of bounds', async () => {
+  await createDoc('t12', { writers: ['user-alice', 'user-bob'] });
+  const a = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't12' });
+  const b = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't12' });
+  await Promise.all([a.connect(), b.connect()]);
+
+  a.localEdit((t) => t.insert(0, 'X'.repeat(25)));
+  await a.flush();
+  await sleep(100);
+
+  const moves = collect(b, 'selection');
+  a.sendSelection(0, 20);
+  const first = await moves.wait((m) => m.end === 20, 3000);
+  assert.equal(first.start, 0);
+  a.sendSelection(5, 15);
+  const second = await moves.wait((m) => m.start === 5 && m.end === 15, 3000);
+  assert.equal(second.end, 15, 'peer must see the newest position');
+  moves.stop();
+
+  // B shrinks the document below the stored range end (15). Both members
+  // must observe the invalidation; the gateway must not keep a wrong range.
+  const clearA = collect(a, 'selection-clear');
+  const clearB = collect(b, 'selection-clear');
+  b.localEdit((t) => t.delete(0, t.length));
+  await b.flush();
+
+  const ca = await clearA.wait((m) => m.userId === 'user-alice', 3000);
+  const cb = await clearB.wait((m) => m.userId === 'user-alice', 3000);
+  assert.equal(ca.reason, 'out-of-bounds');
+  assert.equal(cb.reason, 'out-of-bounds');
+  clearA.stop(); clearB.stop();
+
+  // Selections never touched document convergence/persistence: the delete
+  // replicated normally and the text is empty at every replica.
+  const conv = await settleConvergence([a, b], 't12');
+  assert.equal(conv.text, '');
+
+  // The cleared position is not handed to a late joiner either.
+  const fresh = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't12' });
+  await connectExpectNoSelections(fresh, 500);
+  a.close(); b.close(); fresh.close();
+});
+
+// ---------------------------------------------------------------------------
+// T13 newcomer gets the current valid-selection snapshot; readers report too
+// ---------------------------------------------------------------------------
+const t13 = test('T13 joining member receives active selections; a reader view position is broadcast', async () => {
+  await createDoc('t13', { writers: ['user-alice', 'user-bob'], readers: ['user-carol'] });
+  const a = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't13' });
+  await a.connect();
+  a.localEdit((t) => t.insert(0, 'Y'.repeat(30)));
+  await a.flush();
+  await sleep(100);
+  a.sendSelection(1, 4);
+  await sleep(100);
+
+  // Attach the waiter BEFORE connecting so the join snapshot cannot race it.
+  const b = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't13' });
+  const snaps = collect(b, 'selections');
+  await b.connect();
+  const list = await snaps.wait(() => true, 3000);
+  snaps.stop();
+  assert.equal(list.length, 1);
+  assert.equal(list[0].user.id, 'user-alice');
+  assert.deepEqual([list[0].start, list[0].end], [1, 4]);
+
+  // A read-only member may still point at where it is reading.
+  const carol = new DocClient({ url: WS_URL, token: 'user-carol', docId: 't13' });
+  const carolMoves = collect(b, 'selection');
+  await carol.connect();
+  carol.sendSelection(7, 9);
+  const seen = await carolMoves.wait((m) => m.user.id === 'user-carol', 3000);
+  assert.deepEqual([seen.start, seen.end], [7, 9]);
+  carolMoves.stop();
+
+  a.close(); b.close(); carol.close();
+});
+
+// ---------------------------------------------------------------------------
+// T14 offsets beyond the text length (or malformed) are rejected, not stored
+// ---------------------------------------------------------------------------
+const t14 = test('T14 out-of-range and malformed selections are rejected and never stored or persisted', async () => {
+  await createDoc('t14', { writers: ['user-alice', 'user-bob'] });
+  const a = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't14' });
+  await a.connect();
+  a.localEdit((t) => t.insert(0, '0123456789')); // length 10
+  await a.flush();
+  await sleep(100);
+
+  const errs = collect(a, 'selection-error');
+  a.sendSelection(0, 11);          // end past length
+  const e1 = await errs.wait((m) => m.end === 11, 3000);
+  assert.equal(e1.code, 'BAD_SELECTION');
+  assert.equal(e1.contentLength, 10);
+  a.sendSelection(-1, 2);          // negative start
+  await errs.wait((m) => m.start === -1, 3000);
+  a.sendSelection(5, 3);           // start > end
+  await errs.wait((m) => m.start === 5, 3000);
+  a.sendRaw(JSON.stringify({ type: 'selection', start: 'x', end: 1 }));
+  await errs.wait((m) => m.start === 'x', 3000);
+  errs.stop();
+
+  // Nothing leaked into memory: a newcomer has no selection snapshot...
+  const b = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't14' });
+  await connectExpectNoSelections(b, 500);
+
+  // ...and nothing leaked into the error log or the Yjs update stream.
+  // Real edits still flow and converge exactly as before.
+  a.localEdit((t) => t.insert(t.length, 'more'));
+  await a.flush();
+  const conv = await settleConvergence([a, b], 't14');
+  assert.equal(conv.text, '0123456789more');
+  assert.equal(await sqlCount('doc_updates', `WHERE doc_id='t14'`), 2,
+    'selections must not produce update-log rows');
+  assert.equal(await sqlCount('update_errors',
+    `WHERE error_code='BAD_SELECTION'`), 0,
+    'rejected selections are ephemeral: no update_errors rows');
+
+  a.close(); b.close();
+});
+
+// ---------------------------------------------------------------------------
+// T15 disconnect removes the selection and notifies peers
+// ---------------------------------------------------------------------------
+const t15 = test('T15 a disconnecting user view position is cleared for all peers', async () => {
+  await createDoc('t15', { writers: ['user-alice', 'user-bob'] });
+  const a = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't15' });
+  const b = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't15' });
+  await Promise.all([a.connect(), b.connect()]);
+  a.localEdit((t) => t.insert(0, 'Z'.repeat(12)));
+  await a.flush();
+  await sleep(100);
+
+  const moves = collect(b, 'selection');
+  a.sendSelection(0, 8);
+  await moves.wait((m) => m.user.id === 'user-alice', 3000);
+  moves.stop();
+
+  const clears = collect(b, 'selection-clear');
+  a.hardClose();
+  const gone = await clears.wait((m) => m.userId === 'user-alice', 3000);
+  assert.equal(gone.reason, 'disconnect');
+  clears.stop();
+
+  // Neither later peers nor a fresh joiner can see the departed position.
+  const fresh = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't15' });
+  await connectExpectNoSelections(fresh, 500);
+
+  // Document state itself is unaffected by the presence layer.
+  const conv = await settleConvergence([b, fresh], 't15');
+  assert.equal(conv.text, 'Z'.repeat(12));
+  b.close(); fresh.close();
+});
+
+// ---------------------------------------------------------------------------
+// T16 selection TTL expiry (short-TTL gateway instance)
+// ---------------------------------------------------------------------------
+const t16 = test('T16 an unrefreshed selection expires after the agreed TTL and is broadcast-cleared', async () => {
+  await createDoc('t16', { writers: ['user-alice', 'user-bob'] });
+  // Dedicated gateway with a 300ms ephemeral TTL (config is process-local).
+  await startServer({ extraEnv: { SELECTION_TTL_MS: '300' } });
+
+  const a = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't16' });
+  const b = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't16' });
+  await Promise.all([a.connect(), b.connect()]);
+  a.localEdit((t) => t.insert(0, 'W'.repeat(20)));
+  await a.flush();
+  await sleep(100);
+
+  const moves = collect(b, 'selection');
+  const clears = collect(b, 'selection-clear');
+  a.sendSelection(1, 3);
+  await moves.wait((m) => m.start === 1, 3000);
+  moves.stop();
+
+  const expired = await clears.wait((m) => m.reason === 'expired', 2000);
+  assert.equal(expired.userId, 'user-alice');
+  clears.stop();
+
+  // Post-expiry join sees nothing; a fresh report works (timer rearmed).
+  const late = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't16' });
+  await connectExpectNoSelections(late, 300);
+  const moves2 = collect(b, 'selection');
+  a.sendSelection(4, 6);
+  const again = await moves2.wait((m) => m.start === 4, 2000);
+  assert.equal(again.end, 6);
+  moves2.stop();
+
+  a.close(); b.close(); late.close();
+});
+
+// ---------------------------------------------------------------------------
+// T17 gateway restart: ephemeral positions vanish; document reconverges
+// ---------------------------------------------------------------------------
+const t17 = test('T17 restart drops in-memory selections while reconnected docs match prior state', async () => {
+  await startServer({}); // back to the default TTL
+  await createDoc('t17', { writers: ['user-alice', 'user-bob'] });
+  const a = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't17' });
+  const b = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't17' });
+  await Promise.all([a.connect(), b.connect()]);
+  a.localEdit((t) => t.insert(0, 'durable text survives selection loss'));
+  b.localEdit((t) => t.insert(t.length, '|from-b'));
+  await Promise.all([a.flush({ concurrent: true }), b.flush({ concurrent: true })]);
+  const before = await settleConvergence([a, b], 't17');
+  const beforeHash = before.hash;
+  a.sendSelection(2, 9);
+  await sleep(100);
+  const persisted = await sqlCount('doc_updates', `WHERE doc_id='t17'`);
+
+  // Full process bounce: memory (incl. selections) is discarded.
+  await stopServer();
+  a.hardClose(); b.hardClose();
+  await startServer({});
+
+  const a2 = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't17' });
+  const b2 = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't17' });
+  await connectExpectNoSelections(b2, 400); // restart dropped every position
+  await a2.reconnectWithStateVector();
+  await sleep(100);
+
+  const after = await settleConvergence([a2, b2], 't17');
+  assert.equal(after.hash, beforeHash, 'reconnected document must equal pre-restart state');
+  const recovered = await rebuildAndHash('t17');
+  assert.equal(recovered.hash, beforeHash, 'PostgreSQL-only rebuild must also match');
+  assert.equal(await sqlCount('doc_updates', `WHERE doc_id='t17'`), persisted,
+    'reconnect must not re-persist updates');
+
+  // New edits keep flowing; selection channel keeps working after restart.
+  const moves = collect(b2, 'selection');
+  a2.sendSelection(0, 3);
+  const seen = await moves.wait((m) => m.start === 0, 3000);
+  assert.equal(seen.end, 3);
+  moves.stop();
+  a2.localEdit((t) => t.insert(t.length, 'post'));
+  await a2.flush();
+  const conv = await settleConvergence([a2, b2], 't17');
+  assert.ok(conv.text.endsWith('post'));
+  a2.close(); b2.close();
+});
+
 // ---------------------------------------------------------------------------
 // runner
 // ---------------------------------------------------------------------------
@@ -696,7 +1005,8 @@ async function main() {
   await setupTest();
   await startServer({ crashAfterCommit: false });
 
-  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10];
+  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10,
+    t11, t12, t13, t14, t15, t16, t17];
   let pass = 0;
   const failures = [];
   for (const t of tests) {

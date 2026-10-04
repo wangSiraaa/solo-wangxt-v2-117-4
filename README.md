@@ -116,6 +116,35 @@ JSON 文本帧；Yjs 二进制用 base64 字段传输。
 | c→s | `compact` | `deleteFolded?`, `minUpdates?` → `compact-result` |
 | c→s | `ping` | → `pong` |
 
+### 3.1 临时“查看位置”（选区）协作信息
+
+演示时需要知道同伴正在看 `content` 的哪一段。选区是**纯内存的临时在线状态**，与
+Yjs 文档严格隔离：不写入 `doc_updates`、不进快照、不参与收敛，网关重启即消失。
+
+| 方向 | type | 字段 / 语义 |
+|---|---|---|
+| c→s | `selection` | `start`, `end`：`content` 文本的 UTF-16 偏移区间（与 `Y.Text` 一致），`end==start` 为光标 |
+| s→c | `selection` | `user:{id,name,role}`, `start`, `end`；只广播给同房间**其他**连接（不回环） |
+| s→c | `selection-clear` | `userId`, `reason`：`disconnect` / `expired` / `out-of-bounds` |
+| s→c | `selections` | `selections:[{user,start,end}]`：加入时在 `hello-ok` 后收到的当前有效选区快照（可能缺省） |
+| s→c | `selection-error` | `code=BAD_SELECTION`, `message`, `contentLength`：越界/非法区间被拒 |
+
+语义约定：
+
+* **鉴权边界不变**：只能在 hello 绑定的已鉴权 room 内收发；帧里不带房间号，
+  天然不能串房。reader 也可以上报“正在看哪里”（只读内容、只发在线状态）。
+* **偏移校验**：`0 <= start <= end` 且 `end <= 当前 content 长度`，否则拒绝且
+  不保存任何状态。
+* **短暂有效期（TTL）**：默认 30s（`SELECTION_TTL_MS` 可覆盖），每次重新上报会
+  刷新；超时未刷新即清除并以 `reason:'expired'` 通知同房间。
+* **断线清除**：该用户在房间内最后一个连接断开时，选区以
+  `reason:'disconnect'` 清除并广播。
+* **越界清除（不能展示错误位置）**：每次 Yjs 更新后，网关对已保存选区做对账；
+  任何 `end > 新文本长度` 的选区立即删除，并把 `reason:'out-of-bounds'` 的
+  `selection-clear` 广播给**全房间（含缩短文本的那位编辑者本人）**，任何一端都
+  不会继续显示越界位置。
+* 只改选区永远不产生 update-log 行，也不影响文档状态哈希（见 T11–T17）。
+
 实现中修掉的一个真实收敛 bug：早期版本把 update 回环广播给了发起者，发起者
 本地已应用过同一更新，重复应用导致它与其他副本发散。现在广播显式排除来源
 socket（`room.broadcast(msg, ws)`）。该 bug 正是靠“比对二进制状态哈希而不是
@@ -191,6 +220,13 @@ npm test
 | T8 | 非成员、跨租户、未知 token、reader 写、会话中途撤销权限、HTTP 端点越权全部被拒 |
 | T9 | 3 客户端 60 个最大并发的插入/删除，收敛到同一哈希；日志恰好 61 行，无丢失/重复 |
 | T10 | 正常 SIGTERM 重启后，旧 SV 重连与冷副本全量加入都与重启前哈希一致，且不重复落库 |
+| T11 | 临时选区只送达同房间成员：B 能看到 A 的区间，另一个文档的成员收不到；不回环给自己 |
+| T12 | A 改选区后 B 收到最新位置；B 把文本删短至选区越界时，**双方**都收到 `out-of-bounds` 清除，新加入者也看不到；文档照常收敛 |
+| T13 | 新加入者收到当前有效选区快照；reader 的查看位置同样可广播 |
+| T14 | 超出文本长度 / 负数 / `start>end` / 非整数偏移全部被拒（`selection-error`），不进内存、不进 `update_errors`、不产生 update-log 行 |
+| T15 | A 硬断线后 B 立即收到 `disconnect` 清除，晚加入者也看不到；文档内容不受影响 |
+| T16 | 选区超过约定 TTL（用 `SELECTION_TTL_MS=300` 的网关实例）未刷新即 `expired` 清除并广播；重新上报会重新计时 |
+| T17 | 网关重启后内存选区消失；旧 SV 重连与冷副本、PG 重建三者哈希与重启前一致，不重复落库，新编辑继续流转 |
 
 ---
 
@@ -206,9 +242,9 @@ src/room.js              每文档内存房间（串行队列 + 从快照+尾部
 src/update-service.js    鉴权→校验→去重持久化→应用→广播→ack（含崩溃注入开关）
 src/compaction.js        压缩、双重一致性校验、存储恢复
 src/errorlog.js          update_errors 落库
-src/ws.js                WebSocket 协议
+src/ws.js                WebSocket 协议（含临时 selection/selection-clear）
 src/server.js            Fastify 入口 + 管理/恢复 HTTP 端点
-scripts/lib-client.js    可控脚本客户端（手动 flush、乱序、重发、硬断线、带 SV 重连）
+scripts/lib-client.js    可控脚本客户端（手动 flush、乱序、重发、硬断线、带 SV 重连、选区上报）
 scripts/client-a.js      演示客户端 A
 scripts/client-b.js      演示客户端 B
 scripts/seed.js          demo 租户/用户/文档/成员

@@ -37,6 +37,11 @@ class DocClient {
     this.receivedUpdates = 0;
     this.errors = [];
 
+    // Ephemeral peer view positions: userId -> { user, start, end }.
+    // Replaced from the server snapshot on every (re)join; the server is
+    // authoritative about expiry/out-of-bounds/disconnect clears.
+    this.peerSelections = new Map();
+
     this._waiters = new Map(); // event -> [fn]
   }
 
@@ -106,6 +111,9 @@ class DocClient {
         this.role = msg.role;
         this.seq = msg.seq;
         this.serverSv = Buffer.from(msg.sv, 'base64');
+        // (Re)joining establishes a fresh room view; snapshot ('selections')
+        // arriving next repopulates peer ranges that are still valid.
+        this.peerSelections.clear();
         const state = Buffer.from(msg.state, 'base64');
         if (state.length && this.autoApply) {
           Y.applyUpdate(this.doc, new Uint8Array(state), 'hello-state');
@@ -174,6 +182,35 @@ class DocClient {
       case 'pong':
         this.emit('pong');
         break;
+      case 'selections': {
+        // Authoritative snapshot from the server right after hello-ok.
+        this.peerSelections.clear();
+        for (const s of msg.selections || []) {
+          this.peerSelections.set(s.user.id, {
+            user: s.user, start: s.start, end: s.end,
+          });
+        }
+        this.emit('selections', msg.selections || []);
+        break;
+      }
+      case 'selection': {
+        this.peerSelections.set(msg.user.id, {
+          user: msg.user, start: msg.start, end: msg.end,
+        });
+        this.emit('selection', msg);
+        break;
+      }
+      case 'selection-clear': {
+        this.peerSelections.delete(msg.userId);
+        this.emit('selection-clear', msg);
+        break;
+      }
+      case 'selection-error':
+        // Server rejected an out-of-range/malformed selection; nothing was
+        // stored, so just surface it to listeners and the error list.
+        this.errors.push([msg.code, msg.message]);
+        this.emit('selection-error', msg);
+        break;
       case 'error':
         this.errors.push([msg.code, msg.message]);
         this.emit('error', msg);
@@ -228,6 +265,14 @@ class DocClient {
       this.ws.send(JSON.stringify({ type: 'update', msgId, update: updateB64 }));
       this.log('send update', msgId);
     });
+  }
+
+  // Report the ephemeral view position: UTF-16 offsets [start, end] into
+  // the shared `content` text. end === start is a plain cursor. The server
+  // validates against current length and broadcasts to other room members;
+  // re-sending refreshes the TTL. Returns the raw frame (no ack protocol).
+  sendSelection(start, end = start) {
+    this.ws.send(JSON.stringify({ type: 'selection', start, end }));
   }
 
   // Re-send an exact duplicate frame (same msgId + bytes), proving dedup.

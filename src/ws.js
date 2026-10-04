@@ -16,7 +16,16 @@ const { logError } = require('./errorlog');
 //   server -> client  ack        { msgId, ok, seq, duplicated? } | nack fields
 //   server -> client  update     { seq, msgId, origin, update(b64) }
 //   client -> server  sync-req   { sv(b64) }   -> sync-diff { seq, update(b64) }
+//   client -> server  compact    { deleteFolded?, minUpdates? } -> compact-result
 //   client -> server  ping       -> pong
+//
+// Ephemeral "view position" protocol (memory-only, never persisted, never
+// part of a Yjs update/snapshot):
+//   client -> server  selection       { start, end }   UTF-16 offsets in `content`
+//   server -> client  selection       { user:{id,name,role}, start, end }  (peers)
+//   server -> client  selection-clear { userId, reason }
+//                     reason: out-of-bounds | expired | disconnect
+//   server -> client  selections      [ { user, start, end }, ... ]  (on join)
 //
 // The docId on every frame is the authenticated room's docId: client frames
 // never carry a room id after hello, so a client cannot write into another
@@ -34,7 +43,12 @@ async function wsConnection(socket /* WebSocket */, req) {
 
   socket.on('close', () => {
     closed = true;
-    if (room) room.sockets.delete(socket);
+    if (room) {
+      room.sockets.delete(socket);
+      // View positions are session state: when a user's last socket leaves,
+      // its selection must vanish from every peer immediately.
+      if (ctx) room.clearSelectionsOfUser(ctx.userId, 'disconnect');
+    }
   });
 
   socket.on('message', async (raw) => {
@@ -72,6 +86,8 @@ async function wsConnection(socket /* WebSocket */, req) {
           return await handleSyncReq(socket, room, ctx, frame);
         case 'compact':
           return await handleCompact(socket, room, ctx, frame);
+        case 'selection':
+          return handleSelection(socket, room, ctx, frame);
         default:
           await logError({ docId: room.docId, userId: ctx.userId,
             tenantId: ctx.tenantId, raw: Buffer.from(raw), code: 'UNKNOWN_TYPE',
@@ -165,6 +181,13 @@ async function handleHello(socket, frame, bind) {
     state: diff.toString('base64'),
   });
 
+  // Current valid view positions for the newcomer. Memory-only snapshot;
+  // omitted/empty when nobody else has an active selection.
+  const selections = room.currentSelections();
+  if (selections.length) {
+    safeSend(socket, { type: 'selections', docId, selections });
+  }
+
   room.broadcast({
     type: 'presence',
     docId,
@@ -172,6 +195,27 @@ async function handleHello(socket, frame, bind) {
     joined: true,
     members: memberList(room),
   }, socket);
+}
+
+// Ephemeral view-position reports. The connection is already bound to an
+// authenticated room, so these never touch persistence; offsets beyond the
+// current `content` text length (or malformed ranges) are rejected.
+function handleSelection(socket, room, ctx, frame) {
+  const start = frame.start;
+  const end = frame.end;
+  const result = room.setSelection(
+    { id: ctx.userId, name: ctx.name, role: ctx.role },
+    start, end, socket,
+  );
+  if (!result.ok) {
+    return safeSend(socket, {
+      type: 'selection-error',
+      code: result.code,
+      message: result.message,
+      start, end,
+      contentLength: room.contentLength(),
+    });
+  }
 }
 
 async function handleSyncReq(socket, room, ctx, frame) {

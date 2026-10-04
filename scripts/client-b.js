@@ -15,12 +15,32 @@ async function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function main() {
   const b = new DocClient({ url: URL, token: TOKEN, docId: DOC, name: 'B', verbose: true });
+
+  // Show where collaborators are looking. Ranges are temporary presence:
+  // disconnect, TTL expiry or an edit that pushes them out of bounds clear
+  // them via selection-clear.
+  b.on('selections', (list) => {
+    for (const s of list) {
+      console.log(`B sees ${s.user.name} view [${s.start},${s.end}) on join`);
+    }
+  });
+  b.on('selection', (m) => {
+    console.log(`B sees ${m.user.name} view [${m.start},${m.end})`);
+  });
+  b.on('selection-clear', (m) => {
+    console.log(`B sees ${m.userId} view cleared (${m.reason})`);
+  });
+
   await b.connect();
   console.log('B hello-ok role=', b.role, 'seq=', b.seq, 'text on join=', JSON.stringify(b.text));
 
   await sleep(150);
   b.localEdit((t) => t.insert(t.length, 'B was here too. '));
   await b.flush();
+
+  // A cursor at the end of B's own sentence.
+  b.sendSelection(b.text.length, b.text.length);
+  console.log(`B announced cursor at ${b.text.length}`);
 
   await sleep(300);
   // Concurrent edit against A's second insertion: replace prefix.

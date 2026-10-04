@@ -14,15 +14,39 @@ async function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function main() {
   const a = new DocClient({ url: URL, token: TOKEN, docId: DOC, name: 'A', verbose: true });
+
+  // View-position channel: A reports where it is looking, and prints any
+  // peer ranges/collaborator clears the gateway relays back.
+  a.on('selections', (list) => {
+    for (const s of list) {
+      console.log(`A sees ${s.user.name} view [${s.start},${s.end}) on join`);
+    }
+  });
+  a.on('selection', (m) => {
+    console.log(`A sees ${m.user.name} moved view to [${m.start},${m.end})`);
+  });
+  a.on('selection-clear', (m) => {
+    console.log(`A sees ${m.userId} view cleared (${m.reason})`);
+  });
+
   await a.connect();
   console.log('A hello-ok role=', a.role, 'seq=', a.seq);
 
   a.localEdit((t) => t.insert(0, 'Hello from A. '));
   await a.flush();
 
+  // Point at the word "Hello" (temporary, memory-only).
+  a.sendSelection(0, 5);
+  console.log('A announced view [0,5)');
+
   await sleep(400);
   a.localEdit((t) => t.insert(t.length, 'A adds line two.\n'));
   await a.flush();
+
+  // Move the view to the newly appended line (refreshes the TTL too).
+  const second = a.text.indexOf('A adds');
+  a.sendSelection(second, a.text.length);
+  console.log(`A moved view to [${second},${a.text.length})`);
 
   await sleep(800);
   console.log('A final text:', JSON.stringify(a.text));
